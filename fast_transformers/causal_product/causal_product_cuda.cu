@@ -31,6 +31,17 @@
 #include <assert.h>
 #include <stdio.h>
 
+
+template<typename T>
+inline __device__ T* dynamic_generic_shared_memory() {
+    // Hack that we need to use in order to get NVCC to allow us to use dynamically sized
+    // shared memory blocks of the same name within different template instantiations- See
+    // https://stackoverflow.com/questions/27570552/templated-cuda-kernel-with-dynamic-shared-memory
+    // and https://github.com/pytorch/extension-cpp/issues/59 for discussion.
+    extern __shared__ __align__(sizeof(T)) unsigned char _shared_mem[];
+    return reinterpret_cast<T *>(_shared_mem);
+}
+
 #define ENABLE_NVIDIA_OPTIMIZATIONS
 
 #ifdef ENABLE_NVIDIA_OPTIMIZATIONS
@@ -83,9 +94,9 @@ struct Lmha_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template< int E, bool GO_BACKWARD, int WARPS, int COLS_PER_THREAD = 4 >
+template<typename scalar_t, int E, bool GO_BACKWARD, int WARPS, int COLS_PER_THREAD = 4 >
 __global__ __launch_bounds__(WARPS * THREADS_PER_WARP)
-void lmha_low_occupancy_kernel(Lmha_params<float> params) {
+void lmha_low_occupancy_kernel(Lmha_params<scalar_t> params) {
 
   // The number of threads per block.
   constexpr int THREADS_PER_BLOCK = WARPS * THREADS_PER_WARP;
@@ -98,9 +109,9 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
   static_assert(E % THREADS_PER_WARP == 0, "");
 
   // Shared memory to store V/O.
-  __shared__ float smem_v[COLS_PER_ITER], smem_o[COLS_PER_ITER];
+  __shared__ scalar_t smem_v[COLS_PER_ITER], smem_o[COLS_PER_ITER];
   // Shared memory buffer to performance the reductions.
-  __shared__ float smem_reds[E * WARPS]; 
+  __shared__ scalar_t smem_reds[E * WARPS]; 
 
   // The sequence processed by that block.
   const int bi = blockIdx.z;
@@ -136,8 +147,8 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
   }
 
   // Determine the base pointers for Q and K.
-  const float *ptr_q = &params.q[offset_q];
-  const float *ptr_k = &params.k[offset_k];
+  const scalar_t *ptr_q = &params.q[offset_q];
+  const scalar_t *ptr_k = &params.k[offset_k];
 
   // Is a given row valid?
   int valid_qk[ROWS_PER_THREAD];
@@ -166,12 +177,12 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
   }
 
   // Determine the base pointer for V.
-  const float *ptr_v = &params.v[offset_v];
+  const scalar_t *ptr_v = &params.v[offset_v];
   // The output pointer. 
-  float *ptr_o = &params.out[offset_o];
+  scalar_t *ptr_o = &params.out[offset_o];
 
   // The running KVs.
-  float running_kv[ROWS_PER_THREAD];
+  scalar_t running_kv[ROWS_PER_THREAD];
   #pragma unroll
   for( int ri = 0; ri < ROWS_PER_THREAD; ++ri ) {
     running_kv[ri] = 0.f;
@@ -181,7 +192,7 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
   for( int iter = 0; iter < params.L; iter += COLS_PER_ITER ) {
 
     // Each thread loads a matrix of elements.
-    float q[ROWS_PER_THREAD][COLS_PER_THREAD], k[ROWS_PER_THREAD][COLS_PER_THREAD];
+    scalar_t q[ROWS_PER_THREAD][COLS_PER_THREAD], k[ROWS_PER_THREAD][COLS_PER_THREAD];
 
     // Trigger the memory loads for Q and K.
     #pragma unroll
@@ -233,7 +244,7 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
     }
 
     // Trigger the loads for V. 
-    float ldg_v = valid_vo ? *ptr_v : 0.f;
+    scalar_t ldg_v = valid_vo ? *ptr_v : 0.f;
 
     // Move the load pointers.
     if( GO_BACKWARD ) {
@@ -255,14 +266,14 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
     __syncthreads();
 
     // Read V from shared memory.
-    float v[COLS_PER_THREAD];
+    scalar_t v[COLS_PER_THREAD];
     #pragma unroll
     for( int ci = 0; ci < COLS_PER_THREAD; ++ci ) {
       v[ci] = smem_v[warp*COLS_PER_THREAD + ci];
     }
 
     // Each thread computes local K*V products.
-    float kv[ROWS_PER_THREAD][COLS_PER_THREAD];
+    scalar_t kv[ROWS_PER_THREAD][COLS_PER_THREAD];
     #pragma unroll
     for( int ri = 0; ri < ROWS_PER_THREAD; ++ri ) {
       #pragma unroll
@@ -303,7 +314,7 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
     #pragma unroll
     for( int ii = 0, idx = tidx; ii < SUMS_PER_THREAD; ++ii, idx += THREADS_PER_BLOCK ) {
       if( idx < E ) {
-        float sum = smem_reds[idx];
+        scalar_t sum = smem_reds[idx];
         #pragma unroll
         for( int jj = 1; jj < WARPS; ++jj ) {
           smem_reds[idx + jj*E] = sum += smem_reds[idx + jj*E];
@@ -317,7 +328,7 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
     // Each thread updates his partial products.
     #pragma unroll
     for( int ri = 0; ri < ROWS_PER_THREAD; ++ri ) {
-      float sum = running_kv[ri];
+      scalar_t sum = running_kv[ri];
       if( warp > 0 ) {
         sum += smem_reds[(warp-1)*E + lane + ri*THREADS_PER_WARP];
       }
@@ -328,7 +339,8 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
     }
 
     // Compute the partial output values for that thread.
-    float sum[COLS_PER_THREAD];
+    scalar_t sum[COLS_PER_THREAD];
+
     #pragma unroll
     for( int ci = 0; ci < COLS_PER_THREAD; ++ci ) {
       sum[ci] = q[0][ci] * kv[0][ci];
@@ -380,8 +392,8 @@ void lmha_low_occupancy_kernel(Lmha_params<float> params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template< int E, bool GO_BACKWARD, int WARPS >
-int lmha_low_occupancy_(const Lmha_params<float> &params) {
+template< typename scalar_t, int E, bool GO_BACKWARD, int WARPS >
+int lmha_low_occupancy_(const Lmha_params<scalar_t> &params) {
 
   // Make sure we are not going to launch an invalid grid.
   if( params.H > 65535 || params.B > 65535 ) {
@@ -393,20 +405,20 @@ int lmha_low_occupancy_(const Lmha_params<float> &params) {
   grid.x = params.M;
   grid.y = params.H;
   grid.z = params.B;
-  lmha_low_occupancy_kernel<E, GO_BACKWARD, WARPS><<<grid, WARPS*THREADS_PER_WARP>>>(params);
+  lmha_low_occupancy_kernel<scalar_t, E, GO_BACKWARD, WARPS><<<grid, WARPS*THREADS_PER_WARP>>>(params);
   return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template< int E, bool GO_BACKWARD >
-int lmha_low_occupancy_(const Lmha_params<float> &params, int blocks) {
+template< typename scalar_t, int E, bool GO_BACKWARD >
+int lmha_low_occupancy_(const Lmha_params<scalar_t> &params, int blocks) {
          if( params.M * blocks >= 8*LOW_OCCUPANCY_THRESHOLD ) {
-    return lmha_low_occupancy_<E, GO_BACKWARD,  4>(params);
+    return lmha_low_occupancy_<scalar_t, E, GO_BACKWARD,  4>(params);
   } else if( params.M * blocks >= 4*LOW_OCCUPANCY_THRESHOLD ) {
-    return lmha_low_occupancy_<E, GO_BACKWARD,  8>(params);
+    return lmha_low_occupancy_<scalar_t, E, GO_BACKWARD,  8>(params);
   } else {
-    return lmha_low_occupancy_<E, GO_BACKWARD, 16>(params);
+    return lmha_low_occupancy_<scalar_t, E, GO_BACKWARD, 16>(params);
   }
   return 1;
 }
@@ -421,9 +433,9 @@ static inline __device__ __host__ int smem_buffer_elts_(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template< int E, int THREADS_PER_HEAD, bool GO_BACKWARD >
+template< typename scalar_t, int E, int THREADS_PER_HEAD, bool GO_BACKWARD >
 __global__ 
-void lmha_kernel(Lmha_params<float> params) {
+void lmha_kernel(Lmha_params<scalar_t> params) {
 
   // Make sure E is a multiple of 4.
   static_assert(E % 4 == 0, "");
@@ -434,13 +446,13 @@ void lmha_kernel(Lmha_params<float> params) {
   const int M = round_up(params.M, 4);
 
   // Shared memory to store Q, K and V. Size is 2*smem_buffer_elts.
-  extern __shared__ float smem_[];
+  auto smem_ = dynamic_generic_shared_memory<scalar_t>();
 
   // The various shared memory buffers.
-  float *smem_q = &smem_[0*E];
-  float *smem_k = &smem_[1*E];
-  float *smem_v = &smem_[2*E];
-  float *smem_o = &smem_[2*E + M];
+  scalar_t *smem_q = &smem_[0*E];
+  scalar_t *smem_k = &smem_[1*E];
+  scalar_t *smem_v = &smem_[2*E];
+  scalar_t *smem_o = &smem_[2*E + M];
 
   // The index of the shared memory buffer (for double-buffering).
   int smem_curr = 0;
@@ -465,8 +477,8 @@ void lmha_kernel(Lmha_params<float> params) {
   }
 
   // Determine the base pointers for Q and K.
-  const float *ptr_q = &params.q[offset_q];
-  const float *ptr_k = &params.k[offset_k];
+  const scalar_t *ptr_q = &params.q[offset_q];
+  const scalar_t *ptr_k = &params.k[offset_k];
 
   // The offset to the position loaded by the thread in V and O.
   int offset_v = bi*params.v_stride_B + hi*params.v_stride_H + tidx;
@@ -479,13 +491,13 @@ void lmha_kernel(Lmha_params<float> params) {
   }
 
   // Determine the base pointers for V.
-  const float *ptr_v = &params.v[offset_v];
+  const scalar_t *ptr_v = &params.v[offset_v];
 
   // Is it an active Q/K thread?
   const int active_qk = tidx < params.E;
 
   // Trigger the memory loads for Q and K.
-  float ldg_q = 0.f, ldg_k = 0.f;
+  scalar_t ldg_q = 0.f, ldg_k = 0.f;
   if( active_qk ) {
     ldg_q = *ptr_q;
     ldg_k = *ptr_k;
@@ -495,7 +507,7 @@ void lmha_kernel(Lmha_params<float> params) {
   const int active_v = tidx < params.M;
 
   // Trigger the memory loads for V. 
-  float ldg_v = 0.f;
+  scalar_t ldg_v = 0.f;
   if( active_v ) {
     ldg_v = *ptr_v;
   }
@@ -524,7 +536,7 @@ void lmha_kernel(Lmha_params<float> params) {
   }
 
   // The output pointer.
-  float *out_ptr = &params.out[offset_o];
+  scalar_t *out_ptr = &params.out[offset_o];
 
   // Store to shared memory Q and K.
   if( tidx < E ) { 
@@ -581,9 +593,9 @@ void lmha_kernel(Lmha_params<float> params) {
     }
 
     // Each thread loads a single V value.
-    float v = 0.f;
+    scalar_t v = 0.f;
     if( vo < params.M ) {
-      v = *reinterpret_cast<const float *>(&smem_v[smem_curr*smem_buffer_elts + vo]);
+      v = *reinterpret_cast<const scalar_t *>(&smem_v[smem_curr*smem_buffer_elts + vo]);
     }
 
     // Update the K*V^T product.
@@ -604,7 +616,7 @@ void lmha_kernel(Lmha_params<float> params) {
     }
 
     // Compute the partial output value for that thread.
-    float sum = 0.f;
+    scalar_t sum = 0.f;
     #pragma unroll
     for( int ii = 0; ii < FLOAT4s_PER_THREAD; ++ii ) {
       sum += q[ii].x * kv[ii].x;
@@ -667,8 +679,8 @@ void lmha_kernel(Lmha_params<float> params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template< int E, int THREADS_PER_HEAD, bool GO_BACKWARD >
-int lmha_(const Lmha_params<float> &params) {
+template< typename scalar_t, int E, int THREADS_PER_HEAD, bool GO_BACKWARD >
+int lmha_(const Lmha_params<scalar_t> &params) {
   // The M dimension rounded up to 4.
   int M = round_up(params.M, 4);
 
@@ -680,26 +692,26 @@ int lmha_(const Lmha_params<float> &params) {
 
   // Prepare the kernel.
   dim3 grid(params.H, params.B);
-  size_t smem = smem_buffer_elts_<E>(params)*2*sizeof(float);
-  lmha_kernel<E, THREADS_PER_HEAD, GO_BACKWARD><<<grid, block, smem>>>(params);
+  size_t smem = smem_buffer_elts_<E>(params)*2*sizeof(scalar_t);
+  lmha_kernel<scalar_t, E, THREADS_PER_HEAD, GO_BACKWARD><<<grid, block, smem>>>(params);
   return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template< bool GO_BACKWARD >
-int lmha(const Lmha_params<float> &params) {
+template< typename scalar_t, bool GO_BACKWARD >
+int lmha(const Lmha_params<scalar_t> &params) {
   int blocks = params.B * params.H;
   int res = 1;
   if( blocks < LOW_OCCUPANCY_THRESHOLD ) { 
            if( params.E <=  32 ) {
-      res = lmha_low_occupancy_< 32, GO_BACKWARD>(params, blocks);
+      res = lmha_low_occupancy_< scalar_t, 32, GO_BACKWARD>(params, blocks);
     } else if( params.E <=  64 ) {
-      res = lmha_low_occupancy_< 64, GO_BACKWARD>(params, blocks);
+      res = lmha_low_occupancy_< scalar_t, 64, GO_BACKWARD>(params, blocks);
     } else if( params.E <= 128 ) {
-      res = lmha_low_occupancy_<128, GO_BACKWARD>(params, blocks);
+      res = lmha_low_occupancy_<scalar_t, 128, GO_BACKWARD>(params, blocks);
     } else if( params.E <= 256 ) {
-      res = lmha_low_occupancy_<256, GO_BACKWARD>(params, blocks);
+      res = lmha_low_occupancy_<scalar_t, 256, GO_BACKWARD>(params, blocks);
     }
   } else {
            if( params.E <=  32 ) {
@@ -762,6 +774,7 @@ inline void set_params(Lmha_params<T> &params,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template<typename scalar_t>
 int lmha_fwd(const torch::Tensor queries,
              const torch::Tensor keys,
              const torch::Tensor values,
@@ -784,7 +797,7 @@ int lmha_fwd(const torch::Tensor queries,
   int M = values.size (3);
 
   // The structure of params.
-  Lmha_params<float> params;
+  Lmha_params<scalar_t> params;
   set_params(params, queries, keys, values, product);
 
   // Launch the kernel.
@@ -826,15 +839,15 @@ struct Lmha_bwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template< int D, int THREADS_PER_HEAD >
+template< typename scalar_t, int D, int THREADS_PER_HEAD >
 __global__ __launch_bounds__(D*THREADS_PER_HEAD*2)
-void lmha_bwd_kernel(Lmha_bwd_params<float> params) {
+void lmha_bwd_kernel(Lmha_bwd_params<scalar_t> params) {
 
   // Make sure D is a multiple of 4.
   static_assert(D % 4 == 0, "");
 
   // The shared memory buffers.
-  __shared__ struct Smem { float qg[2*D], kv[2*D], out_kv[2*D]; } smem_[2];
+  __shared__ struct Smem { scalar_t qg[2*D], kv[2*D], out_kv[2*D]; } smem_[2];
 
   // The index of the shared memory buffer (for double-buffering).
   int smem_curr = 0;
@@ -892,14 +905,14 @@ void lmha_bwd_kernel(Lmha_bwd_params<float> params) {
   offset_kv += (params.L-1)*kv_stride_L;
 
   // Determine the base pointers for Q, K, V and G.
-  const float *ptr_qg = &(so == 0 ? params.q : params.g)[offset_qg];
-  const float *ptr_kv = &(so == 0 ? params.k : params.v)[offset_kv]; 
+  const scalar_t *ptr_qg = &(so == 0 ? params.q : params.g)[offset_qg];
+  const scalar_t *ptr_kv = &(so == 0 ? params.k : params.v)[offset_kv]; 
 
   // Is it an active thread?
   const int active = si < hidden_size_per_head;
 
   // Trigger the memory loads for Q, K, V and G.
-  float ldg_qg = 0.f, ldg_kv = 0.f;
+  scalar_t ldg_qg = 0.f, ldg_kv = 0.f;
   if( active ) {
     ldg_qg = *ptr_qg;
     ldg_kv = *ptr_kv;
@@ -940,7 +953,7 @@ void lmha_bwd_kernel(Lmha_bwd_params<float> params) {
   offset_out_kv += (params.L-1)*out_kv_stride_L;
 
   // The output pointer.
-  float *ptr_out_kv = &(so == 0 ? params.out_k : params.out_v)[offset_out_kv];
+  scalar_t *ptr_out_kv = &(so == 0 ? params.out_k : params.out_v)[offset_out_kv];
 
   // Store to shared memory.
   if( si < D ) { 
@@ -975,12 +988,12 @@ void lmha_bwd_kernel(Lmha_bwd_params<float> params) {
     float4 g[FLOAT4s_PER_THREAD];
     #pragma unroll
     for( int ii = 0; ii < FLOAT4s_PER_THREAD; ++ii ) {
-      float *smem_ptr = &smem_[smem_curr].qg[(so^1)*D + oi];
+      scalar_t *smem_ptr = &smem_[smem_curr].qg[(so^1)*D + oi];
       g[ii] = *reinterpret_cast<const float4*>(&smem_ptr[ii*THREADS_PER_HEAD*4]);
     }
 
     // Each thread loads a single from Q or G value.
-    float q = smem_[smem_curr].qg[so*D + oo];
+    scalar_t q = smem_[smem_curr].qg[so*D + oo];
 
     // Update the G*Q^T or Q*G^T product.
     #pragma unroll
@@ -995,12 +1008,12 @@ void lmha_bwd_kernel(Lmha_bwd_params<float> params) {
     float4 v[FLOAT4s_PER_THREAD]; 
     #pragma unroll
     for( int ii = 0; ii < FLOAT4s_PER_THREAD; ++ii ) {
-      float *smem_ptr = &smem_[smem_curr].kv[(so^1)*D + oi];
+      scalar_t *smem_ptr = &smem_[smem_curr].kv[(so^1)*D + oi];
       v[ii] = *reinterpret_cast<const float4*>(&smem_ptr[ii*THREADS_PER_HEAD*4]);
     }
 
     // Compute the partial output value for that thread.
-    float sum = 0.f;
+    scalar_t sum = 0.f;
     #pragma unroll
     for( int ii = 0; ii < FLOAT4s_PER_THREAD; ++ii ) {
       sum += v[ii].x * gq[ii].x;
@@ -1054,8 +1067,8 @@ void lmha_bwd_kernel(Lmha_bwd_params<float> params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template< int D, int THREADS_PER_HEAD >
-int lmha_bwd_(const Lmha_bwd_params<float> &params) {
+template< typename scalar_t, int D, int THREADS_PER_HEAD >
+int lmha_bwd_(const Lmha_bwd_params<scalar_t> &params) {
   int block = D*THREADS_PER_HEAD*2;
   if( block >= 1024 || params.B > 65535 ) {
     return 1;
@@ -1067,7 +1080,8 @@ int lmha_bwd_(const Lmha_bwd_params<float> &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-int lmha_bwd(const Lmha_bwd_params<float> &params) {
+template< typename scalar_t>
+int lmha_bwd(const Lmha_bwd_params<scalar_t> &params) {
   int blocks = params.B * params.H;
   if( blocks < LOW_OCCUPANCY_THRESHOLD ) { 
     return 1;
@@ -1089,6 +1103,7 @@ int lmha_bwd(const Lmha_bwd_params<float> &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+template <typename scalar_t>
 int lmha_bwd(const torch::Tensor queries,
              const torch::Tensor keys,
              const torch::Tensor values,
@@ -1119,7 +1134,7 @@ int lmha_bwd(const torch::Tensor queries,
   // Gradient on Q.
 
   // The structure of params.
-  Lmha_params<float> params;
+  Lmha_params<scalar_t> params;
   set_params(params, grad_out, values, keys, grad_queries);
 
   // Launch the kernel.
@@ -1130,13 +1145,13 @@ int lmha_bwd(const torch::Tensor queries,
 
   // Gradient on K and V together.
 
-  Lmha_bwd_params<float> bwd_params;
-  bwd_params.out_k = grad_keys.data_ptr<float>();
-  bwd_params.out_v = grad_values.data_ptr<float>();
-  bwd_params.q = queries.data_ptr<float>();
-  bwd_params.k = keys.data_ptr<float>();
-  bwd_params.v = values.data_ptr<float>();
-  bwd_params.g = grad_out.data_ptr<float>();
+  Lmha_bwd_params<scalar_t> bwd_params;
+  bwd_params.out_k = grad_keys.data_ptr<scalar_t>();
+  bwd_params.out_v = grad_values.data_ptr<scalar_t>();
+  bwd_params.q = queries.data_ptr<scalar_t>();
+  bwd_params.k = keys.data_ptr<scalar_t>();
+  bwd_params.v = values.data_ptr<scalar_t>();
+  bwd_params.g = grad_out.data_ptr<scalar_t>();
 
   bwd_params.B = N;
   bwd_params.L = L;
@@ -1197,14 +1212,16 @@ int lmha_bwd(const torch::Tensor queries,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-typedef torch::PackedTensorAccessor32<float, 4, torch::RestrictPtrTraits> float_accessor;
+template<typename scalar_t>
+using float_accessor<scalar_t> = torch::PackedTensorAccessor32<scalar_t, 4, torch::RestrictPtrTraits> float_accessor<scalar_t>;
 
+template<typename scalar_t>
 __device__ void get_result(
-    const float_accessor queries,
-    const float_accessor keys,
-    const float_accessor values,
-    float_accessor kv,
-    float_accessor result,
+    const float_accessor<scalar_t> queries,
+    const float_accessor<scalar_t> keys,
+    const float_accessor<scalar_t> values,
+    float_accessor<scalar_t> kv,
+    float_accessor<scalar_t> result,
     const int n,
     const int h,
     const int e,
@@ -1214,7 +1231,7 @@ __device__ void get_result(
     for (int l=0; l<L; l++) {
         kv[n][h][e][m] += keys[n][h][l][e] * values[n][h][l][m];
         __syncthreads();
-        float res = queries[n][h][l][e]*kv[n][h][e][m];
+        scalar_t res = queries[n][h][l][e]*kv[n][h][e][m];
         atomicAdd(
             &result[n][h][l][m],
             res
@@ -1224,11 +1241,11 @@ __device__ void get_result(
 
 
 __global__ void causal_dot_product_kernel(
-    const float_accessor queries,
-    const float_accessor keys,
-    const float_accessor values,
-    float_accessor kv,
-    float_accessor result,
+    const float_accessor<scalar_t> queries,
+    const float_accessor<scalar_t> keys,
+    const float_accessor<scalar_t> values,
+    float_accessor<scalar_t> kv,
+    float_accessor<scalar_t> result,
     const int N,
     const int H,
     const int L,
@@ -1250,12 +1267,12 @@ __global__ void causal_dot_product_kernel(
 
     // Load the shared memory for KV
     const int shared_kv_size = E_per_block * M;
-    extern __shared__ float shared_mem[];
-    float* shared_kv = shared_mem;
-    float* shared_results = shared_mem + shared_kv_size;
-    float* shared_values = shared_results + M;
-    float* shared_keys = shared_values + M*T;
-    float* shared_queries = shared_keys + E_per_block*T;
+    auto shared_mem = dynamic_generic_shared_memory<scalar_t>();
+    scalar_t* shared_kv = shared_mem;
+    scalar_t* shared_results = shared_mem + shared_kv_size;
+    scalar_t* shared_values = shared_results + M;
+    scalar_t* shared_keys = shared_values + M*T;
+    scalar_t* shared_queries = shared_keys + E_per_block*T;
 
     if (threadIdx.x < M) {
         shared_results[threadIdx.x] = 0.0;
@@ -1286,14 +1303,14 @@ __global__ void causal_dot_product_kernel(
         int l = t + l_offset;
         shared_kv[e_local*M + m] += shared_keys[t*E_per_block + e_local] * shared_values[t*M + m];
         __syncthreads();
-        float res = shared_queries[t*E_per_block + e_local] * shared_kv[e_local*M + m];
+        scalar_t res = shared_queries[t*E_per_block + e_local] * shared_kv[e_local*M + m];
         atomicAdd(
             &shared_results[m],
             res
         );
         __syncthreads();
         if (threadIdx.x < M) {
-            float r1 = shared_results[threadIdx.x];
+            scalar_t r1 = shared_results[threadIdx.x];
             atomicAdd(
                 &result[n][h][l][m],
                 r1
@@ -1336,19 +1353,22 @@ void causal_dot_product_(const torch::Tensor queries,
     int shared_mem_const = (E_per_block + 1)*M;
     int shared_mem_per_time = (M + 2*E_per_block);
     const int T = int(((12 * 1024) - shared_mem_const) / shared_mem_per_time);
-    const int shared_mem_forward = ((T*shared_mem_per_time) + shared_mem_const) * sizeof(float);
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(queries.scalar_type(), "causal_dot_product", [&] {
+        const int shared_mem_forward = ((T*shared_mem_per_time) + shared_mem_const) * sizeof(scalar_t);
 
-    for (int l_offset=0; l_offset < L; l_offset += T) {
-     causal_dot_product_kernel
-            <<<blocks, MUL_PER_BLOCK, shared_mem_forward>>>(
-            queries.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            keys.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            values.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            kv.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            product.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            N, H, L, E, M, E_per_block, blocks_per_sequence, T, l_offset
-        );
-    }
+        for (int l_offset=0; l_offset < L; l_offset += T) {
+         causal_dot_product_kernel
+                <<<blocks, MUL_PER_BLOCK, shared_mem_forward>>>(
+                queries.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                keys.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                values.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                kv.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                product.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                N, H, L, E, M, E_per_block, blocks_per_sequence, T, l_offset
+            );
+        }
+    });
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1383,14 +1403,14 @@ void causal_dot_product(const torch::Tensor queries,
 // queries: E*T, (values, gradout): M_per_block*T, kv:E*M_per_block, results:E
 // Total memory:
 __global__ void causal_dot_backward_query_key_kernel(
-    const float_accessor queries,
-    const float_accessor keys,
-    const float_accessor values,
-    const float_accessor grad_out,
-    float_accessor kv,
-    float_accessor kv_backwards,
-    float_accessor grad_queries,
-    float_accessor grad_keys,
+    const float_accessor<scalar_t> queries,
+    const float_accessor<scalar_t> keys,
+    const float_accessor<scalar_t> values,
+    const float_accessor<scalar_t> grad_out,
+    float_accessor<scalar_t> kv,
+    float_accessor<scalar_t> kv_backwards,
+    float_accessor<scalar_t> grad_queries,
+    float_accessor<scalar_t> grad_keys,
     int N,
     int H,
     int L,
@@ -1416,18 +1436,18 @@ __global__ void causal_dot_backward_query_key_kernel(
     // Backward memory
     // queries: E*T, (values, gradout): M_per_block*T, kv:E*M_per_block, results:E
     // Load the shared memory for KV
-    extern __shared__ float shared_mem[];
+    auto shared_mem = dynamic_generic_shared_memory<scalar_t>();
     const int shared_kv_size = M_per_block * E;
-    float* shared_kv = shared_mem;
-    float* shared_kv_bw = shared_mem + shared_kv_size;
-    float* shared_results = shared_kv_bw + shared_kv_size;
-    float* shared_results_bw = shared_results + E;
-    float* shared_keys = shared_results_bw + E;
-    float* shared_values = shared_keys + E*T;
-    float* shared_gradout = shared_values + M_per_block*T;
-    float* shared_queries_bw = shared_gradout + M_per_block*T;
-    float* shared_values_bw = shared_queries_bw + E*T;
-    float* shared_gradout_bw = shared_values_bw + M_per_block*T;
+    scalar_t* shared_kv = shared_mem;
+    scalar_t* shared_kv_bw = shared_mem + shared_kv_size;
+    scalar_t* shared_results = shared_kv_bw + shared_kv_size;
+    scalar_t* shared_results_bw = shared_results + E;
+    scalar_t* shared_keys = shared_results_bw + E;
+    scalar_t* shared_values = shared_keys + E*T;
+    scalar_t* shared_gradout = shared_values + M_per_block*T;
+    scalar_t* shared_queries_bw = shared_gradout + M_per_block*T;
+    scalar_t* shared_values_bw = shared_queries_bw + E*T;
+    scalar_t* shared_gradout_bw = shared_values_bw + M_per_block*T;
 
     if (threadIdx.x < E) {
         shared_results[threadIdx.x] = 0.0;
@@ -1470,8 +1490,8 @@ __global__ void causal_dot_backward_query_key_kernel(
         shared_kv[m_local*E + e] += shared_keys[t*E + e] * shared_values[t*M_per_block + m_local];
         shared_kv_bw[m_local*E + e] += shared_queries_bw[t*E + e] * shared_gradout_bw[t*M_per_block + m_local];
         __syncthreads();
-        float res = shared_gradout[t*M_per_block + m_local] * shared_kv[m_local*E + e];
-        float res_bw = shared_values_bw[t*M_per_block + m_local] * shared_kv_bw[m_local*E + e];
+        scalar_t res = shared_gradout[t*M_per_block + m_local] * shared_kv[m_local*E + e];
+        scalar_t res_bw = shared_values_bw[t*M_per_block + m_local] * shared_kv_bw[m_local*E + e];
         atomicAdd(
             &shared_results[e],
             res
@@ -1482,8 +1502,8 @@ __global__ void causal_dot_backward_query_key_kernel(
         );
         __syncthreads();
         if (threadIdx.x < E) {
-            float rq = shared_results[threadIdx.x];
-            float rk = shared_results_bw[threadIdx.x];
+            scalar_t rq = shared_results[threadIdx.x];
+            scalar_t rk = shared_results_bw[threadIdx.x];
             atomicAdd(
                 &grad_queries[n][h][l][e],
                 rq
@@ -1502,14 +1522,15 @@ __global__ void causal_dot_backward_query_key_kernel(
 }
 
 
+template<typename scalar_t>
 __global__ void causal_dot_backward_value_kernel(
-    const float_accessor queries,
-    const float_accessor keys,
-    const float_accessor values,
-    const float_accessor grad_out,
-    float_accessor kv,
-    float_accessor grad_keys,
-    float_accessor grad_values,
+    const float_accessor<scalar_t> queries,
+    const float_accessor<scalar_t> keys,
+    const float_accessor<scalar_t> values,
+    const float_accessor<scalar_t> grad_out,
+    float_accessor<scalar_t> kv,
+    float_accessor<scalar_t> grad_keys,
+    float_accessor<scalar_t> grad_values,
     int N,
     int H,
     int L,
@@ -1531,12 +1552,12 @@ __global__ void causal_dot_backward_value_kernel(
 
     // Load the shared memory for KV
     const int shared_kv_size = E_per_block * M;
-    extern __shared__ float shared_mem[];
-    float* shared_kv = shared_mem;
-    float* shared_results = shared_mem + shared_kv_size;
-    float* shared_gradout = shared_results + M;
-    float* shared_keys = shared_gradout + M*T;
-    float* shared_queries = shared_keys + E_per_block*T;
+    auto shared_mem = dynamic_generic_shared_memory<scalar_t>();
+    scalar_t* shared_kv = shared_mem;
+    scalar_t* shared_results = shared_mem + shared_kv_size;
+    scalar_t* shared_gradout = shared_results + M;
+    scalar_t* shared_keys = shared_gradout + M*T;
+    scalar_t* shared_queries = shared_keys + E_per_block*T;
 
     if (threadIdx.x < M) {
         shared_results[threadIdx.x] = 0.0;
@@ -1572,14 +1593,14 @@ __global__ void causal_dot_backward_value_kernel(
         int l_b = L - l -1;
         shared_kv[e_local*M + m] += shared_queries[t*E_per_block + e_local] * shared_gradout[t*M + m];
         __syncthreads();
-        float res = shared_keys[t*E_per_block + e_local] * shared_kv[e_local*M + m];
+        scalar_t res = shared_keys[t*E_per_block + e_local] * shared_kv[e_local*M + m];
         atomicAdd(
             &shared_results[m],
             res
         );
         __syncthreads();
         if (threadIdx.x < M) {
-            float r1 = shared_results[threadIdx.x];
+            scalar_t r1 = shared_results[threadIdx.x];
             atomicAdd(
                 &grad_values[n][h][l_b][m],
                 r1
@@ -1630,47 +1651,50 @@ void causal_dot_backward_(const torch::Tensor queries,
     int shared_mem_const = 2*E*(1+M_per_block);
     int shared_mem_per_time = 2*(E + 2*M_per_block);
     int T = int(((12 * 1024) - shared_mem_const) / shared_mem_per_time);
-    const int shared_mem_qk_backward = ((T*shared_mem_per_time) + shared_mem_const) * sizeof(float);
-    for (int l_offset=0; l_offset < L; l_offset += T) {
-        causal_dot_backward_query_key_kernel
-            <<<blocks, MUL_PER_BLOCK, shared_mem_qk_backward>>>(
-            queries.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            keys.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            values.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            grad_out.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            kv.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            kv_backward.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            grad_queries.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            grad_keys.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            N, H, L, E, M, M_per_block, blocks_per_sequence, T, l_offset
-        );
-    }
+    
+    AT_DISPACH_FLOATING_TYPES_AND_HALF(queries.scalar_type(), "causal_dot_backward", [&] {
+        const int shared_mem_qk_backward = ((T*shared_mem_per_time) + shared_mem_const) * sizeof(scalar_t);
+        for (int l_offset=0; l_offset < L; l_offset += T) {
+            causal_dot_backward_query_key_kernel
+                <<<blocks, MUL_PER_BLOCK, shared_mem_qk_backward>>>(
+                queries.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                keys.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                values.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                grad_out.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                kv.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                kv_backward.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                grad_queries.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                grad_keys.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                N, H, L, E, M, M_per_block, blocks_per_sequence, T, l_offset
+            );
+        }
 
-    int MPB = min(threads, E*M);
-    // make sure that MUL_PER_BLOCK is divisible by M;
-    MPB = int(MPB / M) *  M;
-    const int blocks_per_sequence_value = ((E*M) + MPB - 1)/ MPB;
-    const int E_per_block = MPB / M;
-    const int blocks_value  = N*H*blocks_per_sequence_value;
+        int MPB = min(threads, E*M);
+        // make sure that MUL_PER_BLOCK is divisible by M;
+        MPB = int(MPB / M) *  M;
+        const int blocks_per_sequence_value = ((E*M) + MPB - 1)/ MPB;
+        const int E_per_block = MPB / M;
+        const int blocks_value  = N*H*blocks_per_sequence_value;
 
-    shared_mem_const = (E_per_block + 1)*M;
-    shared_mem_per_time = (M + 2*E_per_block);
-    T = int(((12 * 1024) - shared_mem_const) / shared_mem_per_time);
-    const int shared_mem_v_backward = ((T*shared_mem_per_time) + shared_mem_const) * sizeof(float);
-    kv.zero_();
-    for (int l_offset=0; l_offset < L; l_offset += T) {
-        causal_dot_backward_value_kernel
-            <<<blocks_value, MPB, shared_mem_v_backward>>>(
-            queries.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            keys.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            values.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            grad_out.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            kv.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            grad_keys.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            grad_values.packed_accessor32<float, 4, torch::RestrictPtrTraits>(),
-            N, H, L, E, M, E_per_block, blocks_per_sequence_value, T, l_offset
-        );
-    }
+        shared_mem_const = (E_per_block + 1)*M;
+        shared_mem_per_time = (M + 2*E_per_block);
+        T = int(((12 * 1024) - shared_mem_const) / shared_mem_per_time);
+        const int shared_mem_v_backward = ((T*shared_mem_per_time) + shared_mem_const) * sizeof(scalar_t);
+        kv.zero_();
+        for (int l_offset=0; l_offset < L; l_offset += T) {
+            causal_dot_backward_value_kernel
+                <<<blocks_value, MPB, shared_mem_v_backward>>>(
+                queries.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                keys.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                values.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                grad_out.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                kv.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                grad_keys.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                grad_values.packed_accessor32<scalar_t, 4, torch::RestrictPtrTraits>(),
+                N, H, L, E, M, E_per_block, blocks_per_sequence_value, T, l_offset
+            );
+        }
+    });
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
