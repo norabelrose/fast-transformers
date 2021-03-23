@@ -28,6 +28,8 @@
 //
 
 #include <torch/extension.h>
+#include <THC/THCAtomics.cuh>
+
 #include <assert.h>
 #include <stdio.h>
 
@@ -38,7 +40,8 @@ inline __device__ T* dynamic_generic_shared_memory() {
     // shared memory blocks of the same name within different template instantiations- See
     // https://stackoverflow.com/questions/27570552/templated-cuda-kernel-with-dynamic-shared-memory
     // and https://github.com/pytorch/extension-cpp/issues/59 for discussion.
-    extern __shared__ __align__(sizeof(T)) unsigned char _shared_mem[];
+    // We may need to use __align__(sizeof(T)) here but it doesn't seem to compile that way?
+    extern __shared__ unsigned char _shared_mem[];
     return reinterpret_cast<T *>(_shared_mem);
 }
 
@@ -224,8 +227,8 @@ void lmha_low_occupancy_kernel(Lmha_params<scalar_t> params) {
         }
 
         // Load Q/K if they are valid.
-        q[ri][ci] = valid ? ptr_q[offset_q] : 0.f;
-        k[ri][ci] = valid ? ptr_k[offset_k] : 0.f;
+        q[ri][ci] = valid ? ptr_q[offset_q] : static_cast<scalar_t>(0.f);
+        k[ri][ci] = valid ? ptr_k[offset_k] : static_cast<scalar_t>(0.f);
       }
     }
 
@@ -244,7 +247,7 @@ void lmha_low_occupancy_kernel(Lmha_params<scalar_t> params) {
     }
 
     // Trigger the loads for V. 
-    scalar_t ldg_v = valid_vo ? *ptr_v : 0.f;
+    scalar_t ldg_v = valid_vo ? *ptr_v : static_cast<scalar_t>(0.0f);
 
     // Move the load pointers.
     if( GO_BACKWARD ) {
@@ -355,7 +358,7 @@ void lmha_low_occupancy_kernel(Lmha_params<scalar_t> params) {
     for( int mask = THREADS_PER_WARP / 2; mask >= 1; mask /= 2 ) {
       #pragma unroll
       for( int ci = 0; ci < COLS_PER_THREAD; ++ci ) {
-        sum[ci] += __shfl_xor_sync(uint32_t(-1), sum[ci], mask);
+        sum[ci] += __shfl_xor_sync<scalar_t>(uint32_t(-1), sum[ci], mask);
       }
     }
 
@@ -523,8 +526,11 @@ void lmha_kernel(Lmha_params<scalar_t> params) {
     ptr_v += params.v_stride_L;
   }
 
+  // The number of individual scalar_t values that can fit in a float4.
+  // For full precision this is 4, but it's 8 for half-precision.
+  constexpr int SCALARS_PER_FLOAT4 = sizeof(float4) / sizeof(scalar_t);
   // The number of FLOAT4s per head.
-  constexpr int FLOAT4s_PER_HEAD = E / 4;
+  constexpr int FLOAT4s_PER_HEAD = E / SCALARS_PER_FLOAT4;
   // The number of FLOAT4s per thread.
   constexpr int FLOAT4s_PER_THREAD = FLOAT4s_PER_HEAD / THREADS_PER_HEAD;
 
@@ -584,11 +590,11 @@ void lmha_kernel(Lmha_params<scalar_t> params) {
     // Make sure the data is in shared memory.
     __syncthreads();
 
-    // Each thread loads 4 values from K.
+    // Each thread loads 4/8 values from K.
     float4 k[FLOAT4s_PER_THREAD];
     #pragma unroll
     for( int ii = 0; ii < FLOAT4s_PER_THREAD; ++ii ) {
-      int ki = tidx % THREADS_PER_HEAD * 4 + ii * THREADS_PER_HEAD * 4;
+      int ki = tidx % THREADS_PER_HEAD * SCALARS_PER_FLOAT4 + ii * THREADS_PER_HEAD * SCALARS_PER_FLOAT4;
       k[ii] = *reinterpret_cast<const float4*>(&smem_k[smem_curr*smem_buffer_elts + ki]);
     }
 
@@ -611,7 +617,7 @@ void lmha_kernel(Lmha_params<scalar_t> params) {
     float4 q[FLOAT4s_PER_THREAD]; 
     #pragma unroll
     for( int ii = 0; ii < FLOAT4s_PER_THREAD; ++ii ) {
-      int qi = tidx % THREADS_PER_HEAD * 4 + ii * THREADS_PER_HEAD * 4;
+      int qi = tidx % THREADS_PER_HEAD * SCALARS_PER_FLOAT4 + ii * THREADS_PER_HEAD * SCALARS_PER_FLOAT4;
       q[ii] = *reinterpret_cast<const float4*>(&smem_q[smem_curr*smem_buffer_elts + qi]);
     }
 
@@ -631,7 +637,7 @@ void lmha_kernel(Lmha_params<scalar_t> params) {
       // Finalize the sum for each head.
       #pragma unroll
       for( int mask = THREADS_PER_HEAD / 2; mask >= 1; mask /= 2 ) {
-        sum += __shfl_xor_sync(uint32_t(-1), sum, mask);
+        sum += __shfl_xor_sync<scalar_t>(uint32_t(-1), sum, mask);
       }
 
       // Store to shared memory.
@@ -715,15 +721,15 @@ int lmha(const Lmha_params<scalar_t> &params) {
     }
   } else {
            if( params.E <=  32 ) {
-      res = lmha_< 32, 1, GO_BACKWARD>(params);
+      res = lmha_< scalar_t, 32, 1, GO_BACKWARD>(params);
     } else if( params.E <=  48 ) {
-      res = lmha_< 48, 1, GO_BACKWARD>(params);
+      res = lmha_< scalar_t, 48, 1, GO_BACKWARD>(params);
     } else if( params.E <=  64 ) {
-      res = lmha_< 64, 1, GO_BACKWARD>(params);
+      res = lmha_< scalar_t, 64, 1, GO_BACKWARD>(params);
     } else if( params.E <= 128 ) {
-      res = lmha_<128, 2, GO_BACKWARD>(params);
+      res = lmha_<scalar_t, 128, 2, GO_BACKWARD>(params);
     } else if( params.E <= 256 ) {
-      res = lmha_<256, 4, GO_BACKWARD>(params);
+      res = lmha_<scalar_t, 256, 4, GO_BACKWARD>(params);
     }
   }
   return res;
@@ -801,7 +807,7 @@ int lmha_fwd(const torch::Tensor queries,
   set_params(params, queries, keys, values, product);
 
   // Launch the kernel.
-  return lmha<false>(params);
+  return lmha<scalar_t, false>(params);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1028,7 +1034,7 @@ void lmha_bwd_kernel(Lmha_bwd_params<scalar_t> params) {
       // Finalize the sum for each head.
       #pragma unroll
       for( int mask = THREADS_PER_HEAD / 2; mask >= 1; mask /= 2 ) {
-        sum += __shfl_xor_sync(uint32_t(-1), sum, mask);
+        sum += __shfl_xor_sync<scalar_t>(uint32_t(-1), sum, mask);
       }
 
       // Store to shared memory.
@@ -1074,7 +1080,7 @@ int lmha_bwd_(const Lmha_bwd_params<scalar_t> &params) {
     return 1;
   }
   dim3 grid(params.H, params.B);
-  lmha_bwd_kernel<D, THREADS_PER_HEAD><<<grid, block>>>(params);
+  lmha_bwd_kernel<scalar_t, D, THREADS_PER_HEAD><<<grid, block>>>(params);
   return 0;
 }
 
@@ -1090,13 +1096,13 @@ int lmha_bwd(const Lmha_bwd_params<scalar_t> &params) {
   int hidden_size_per_head = max(params.E, params.M);
   int res = 1;
   if( hidden_size_per_head <= 32 ) {
-    res = lmha_bwd_< 32, 1>(params);
+    res = lmha_bwd_<scalar_t, 32, 1>(params);
   } else if( hidden_size_per_head <= 64 ) {
-    res = lmha_bwd_< 64, 1>(params);
+    res = lmha_bwd_<scalar_t, 64, 1>(params);
   } else if( hidden_size_per_head <= 128 ) {
-    res = lmha_bwd_<128, 2>(params);
+    res = lmha_bwd_<scalar_t, 128, 2>(params);
   } else if( hidden_size_per_head <= 256 ) {
-    res = lmha_bwd_<256, 4>(params);
+    res = lmha_bwd_<scalar_t, 256, 4>(params);
   }
   return res;
 }
@@ -1138,7 +1144,7 @@ int lmha_bwd(const torch::Tensor queries,
   set_params(params, grad_out, values, keys, grad_queries);
 
   // Launch the kernel.
-  int res = lmha<false>(params);
+  int res = lmha<scalar_t, false>(params);
   if( res ) {
     return res;
   }
@@ -1189,7 +1195,7 @@ int lmha_bwd(const torch::Tensor queries,
 
     // Launch the kernel.
     set_params(params, values, grad_out, queries, grad_keys);
-    res = lmha<true>(params);
+    res = lmha<scalar_t, true>(params);
     if( res ) {
       return res;
     }
@@ -1198,7 +1204,7 @@ int lmha_bwd(const torch::Tensor queries,
 
     // Launch the kernel.
     set_params(params, keys, queries, grad_out, grad_values);
-    return lmha<true>(params);
+    return lmha<scalar_t, true>(params);
   }
 
   // It worked...
@@ -1213,7 +1219,7 @@ int lmha_bwd(const torch::Tensor queries,
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename scalar_t>
-using float_accessor<scalar_t> = torch::PackedTensorAccessor32<scalar_t, 4, torch::RestrictPtrTraits> float_accessor<scalar_t>;
+using float_accessor = torch::PackedTensorAccessor32<scalar_t, 4, torch::RestrictPtrTraits>;
 
 template<typename scalar_t>
 __device__ void get_result(
@@ -1232,7 +1238,7 @@ __device__ void get_result(
         kv[n][h][e][m] += keys[n][h][l][e] * values[n][h][l][m];
         __syncthreads();
         scalar_t res = queries[n][h][l][e]*kv[n][h][e][m];
-        atomicAdd(
+        gpuAtomicAdd(
             &result[n][h][l][m],
             res
         );
@@ -1240,6 +1246,7 @@ __device__ void get_result(
 }
 
 
+template<typename scalar_t>
 __global__ void causal_dot_product_kernel(
     const float_accessor<scalar_t> queries,
     const float_accessor<scalar_t> keys,
@@ -1304,14 +1311,14 @@ __global__ void causal_dot_product_kernel(
         shared_kv[e_local*M + m] += shared_keys[t*E_per_block + e_local] * shared_values[t*M + m];
         __syncthreads();
         scalar_t res = shared_queries[t*E_per_block + e_local] * shared_kv[e_local*M + m];
-        atomicAdd(
+        gpuAtomicAdd(
             &shared_results[m],
             res
         );
         __syncthreads();
         if (threadIdx.x < M) {
             scalar_t r1 = shared_results[threadIdx.x];
-            atomicAdd(
+            gpuAtomicAdd(
                 &result[n][h][l][m],
                 r1
             );
@@ -1377,10 +1384,12 @@ void causal_dot_product(const torch::Tensor queries,
                         const torch::Tensor keys,
                         const torch::Tensor values,
                         torch::Tensor product) {
+  int fallback = 1; 
+
 #ifdef ENABLE_NVIDIA_OPTIMIZATIONS
-  int fallback = nvidia::lmha_fwd(queries, keys, values, product);
-#else
-  int fallback = 1;
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(queries.scalar_type(), "causal_dot_product", [&] {
+    fallback = nvidia::lmha_fwd<scalar_t>(queries, keys, values, product);
+  });
 #endif
   if( fallback ) {
     causal_dot_product_(queries, keys, values, product);
@@ -1402,6 +1411,7 @@ void causal_dot_product(const torch::Tensor queries,
 // Backward
 // queries: E*T, (values, gradout): M_per_block*T, kv:E*M_per_block, results:E
 // Total memory:
+template<typename scalar_t>
 __global__ void causal_dot_backward_query_key_kernel(
     const float_accessor<scalar_t> queries,
     const float_accessor<scalar_t> keys,
@@ -1492,11 +1502,11 @@ __global__ void causal_dot_backward_query_key_kernel(
         __syncthreads();
         scalar_t res = shared_gradout[t*M_per_block + m_local] * shared_kv[m_local*E + e];
         scalar_t res_bw = shared_values_bw[t*M_per_block + m_local] * shared_kv_bw[m_local*E + e];
-        atomicAdd(
+        gpuAtomicAdd(
             &shared_results[e],
             res
         );
-        atomicAdd(
+        gpuAtomicAdd(
             &shared_results_bw[e],
             res_bw
         );
@@ -1504,11 +1514,11 @@ __global__ void causal_dot_backward_query_key_kernel(
         if (threadIdx.x < E) {
             scalar_t rq = shared_results[threadIdx.x];
             scalar_t rk = shared_results_bw[threadIdx.x];
-            atomicAdd(
+            gpuAtomicAdd(
                 &grad_queries[n][h][l][e],
                 rq
             );
-            atomicAdd(
+            gpuAtomicAdd(
                 &grad_keys[n][h][l_b][e],
                 rk
             );
@@ -1594,14 +1604,14 @@ __global__ void causal_dot_backward_value_kernel(
         shared_kv[e_local*M + m] += shared_queries[t*E_per_block + e_local] * shared_gradout[t*M + m];
         __syncthreads();
         scalar_t res = shared_keys[t*E_per_block + e_local] * shared_kv[e_local*M + m];
-        atomicAdd(
+        gpuAtomicAdd(
             &shared_results[m],
             res
         );
         __syncthreads();
         if (threadIdx.x < M) {
             scalar_t r1 = shared_results[threadIdx.x];
-            atomicAdd(
+            gpuAtomicAdd(
                 &grad_values[n][h][l_b][m],
                 r1
             );
@@ -1652,7 +1662,7 @@ void causal_dot_backward_(const torch::Tensor queries,
     int shared_mem_per_time = 2*(E + 2*M_per_block);
     int T = int(((12 * 1024) - shared_mem_const) / shared_mem_per_time);
     
-    AT_DISPACH_FLOATING_TYPES_AND_HALF(queries.scalar_type(), "causal_dot_backward", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(queries.scalar_type(), "causal_dot_backward", [&] {
         const int shared_mem_qk_backward = ((T*shared_mem_per_time) + shared_mem_const) * sizeof(scalar_t);
         for (int l_offset=0; l_offset < L; l_offset += T) {
             causal_dot_backward_query_key_kernel
@@ -1706,16 +1716,18 @@ void causal_dot_backward(const torch::Tensor queries,
                          torch::Tensor grad_queries,
                          torch::Tensor grad_keys,
                          torch::Tensor grad_values) {
+  int fallback = 1;
+
 #ifdef ENABLE_NVIDIA_OPTIMIZATIONS
-  int fallback = nvidia::lmha_bwd(queries,
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(queries.scalar_type(), "causal_dot_backward", [&] {
+    fallback = nvidia::lmha_bwd<scalar_t>(queries,
                                   keys,
                                   values,
                                   grad_out,
                                   grad_queries,
                                   grad_keys,
                                   grad_values);
-#else
-  int fallback = 1;
+  });
 #endif
   if( fallback ) {
     causal_dot_backward_(queries, keys, values, grad_out, grad_queries, grad_keys, grad_values);
